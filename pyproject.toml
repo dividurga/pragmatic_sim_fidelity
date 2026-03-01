@@ -5,12 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pragmatic_sim_fidelity"
 version = "0.1.0"
-description = "A basic starter for Python packages."
+description = "A starter for P2S2R project tetsing multiple simulators."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
    "matplotlib",
    "numpy",
+   "pybullet",
+
 ]
 
 [project.optional-dependencies]
