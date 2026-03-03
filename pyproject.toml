@@ -12,6 +12,7 @@ dependencies = [
    "matplotlib",
    "numpy",
    "pybullet",
+   "pin>=2.6",
 
 ]
 

@@ -1,70 +1,327 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
+import os
 import numpy as np
 
 from ..core.types import State, Trajectory
 from ..registry import register_task
+from ..simulators.geom3d_sim.collision import spheres_aabbs_collide
 
 AABB = Tuple[float, float, float, float, float, float]  # xmin,ymin,zmin,xmax,ymax,zmax
 
+def sphere_out_of_bounds_open_front(c: np.ndarray, r: float, bounds: AABB) -> bool:
+    """
+    Bounds check for ONE sphere, with open front face at y=ymax.
+    Closed faces: xmin, xmax, ymin, zmin, zmax.
+    """
+    xmin, ymin, zmin, xmax, ymax, zmax = map(float, bounds)
+    x, y, z = map(float, c)
+    r = float(r)
+
+    if x - r < xmin: return True
+    if x + r > xmax: return True
+    if y - r < ymin: return True          # back wall closed
+    # if y + r > ymax: return True         # FRONT OPEN -> do NOT check
+    if z - r < zmin: return True
+    if z + r > zmax: return True
+    return False
+
+
+def spheres_out_of_bounds_open_front(
+    spheres: List[Tuple[np.ndarray, float]],
+    bounds: AABB,
+) -> bool:
+    """Apply open-front bounds check to ALL spheres."""
+    for c, r in spheres:
+        if sphere_out_of_bounds_open_front(np.asarray(c, dtype=float), float(r), bounds):
+            return True
+    return False
+
+
+
+def collided_obstacles_only(
+    spheres: List[Tuple[np.ndarray, float]],
+    obstacles: List[AABB],
+) -> bool:
+    return spheres_aabbs_collide(spheres, obstacles)
+# ----------------------------
+# Pinocchio Franka wrapper
+# ----------------------------
+class FrankaGeom3D:
+    """
+    Pinocchio-backed Franka kinematics with link-sphere collision proxies.
+    Uses Panda URDF from pybullet_data.
+    """
+
+    def __init__(
+        self,
+        urdf_path: str,
+        ee_frame: str = "panda_hand",
+        base_translation: Tuple[float, float, float] = (-0.1, 0.95, -0.1),
+        proxy_radius: float = 0.03,
+        spheres_per_segment: int = 4,
+    ):
+        import pinocchio as pin  # type: ignore
+
+        self.pin = pin
+        self.model = pin.buildModelFromUrdf(urdf_path) # these won't error out
+        self.data = self.model.createData()
+
+        self.base_t = np.array(base_translation, dtype=float)
+        self.proxy_r = float(proxy_radius)
+        self.K = int(spheres_per_segment)
+
+        # Identify the 7 Panda arm joints by name (robust)
+        self.arm_joint_names = [f"panda_joint{i}" for i in range(1, 8)]
+        self.arm_jids = []
+        for name in self.arm_joint_names:
+            jid = self.model.getJointId(name)
+            if jid == 0:
+                raise ValueError(f"Joint '{name}' not found in URDF. Check URDF joint names.")
+            self.arm_jids.append(jid)
+
+        # Assume first 7 q entries correspond to panda_joint1..7 (true for common Panda URDFs)
+        self.nq_arm = 7
+        if self.model.nq < self.nq_arm:
+            raise ValueError(f"URDF model has nq={self.model.nq} < 7; wrong URDF?")
+
+        self.lower = self.model.lowerPositionLimit[: self.nq_arm].copy()
+        self.upper = self.model.upperPositionLimit[: self.nq_arm].copy()
+
+        # EE frame id
+        self.ee_fid = self.model.getFrameId(ee_frame)
+        if self.ee_fid == len(self.model.frames):
+            raise ValueError(f"EE frame '{ee_frame}' not found in URDF frames.")
+        self.ee_frame = ee_frame
+
+    def clamp_q(self, q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=float).copy()
+        return np.minimum(np.maximum(q, self.lower), self.upper)
+
+    def _q_full(self, q_arm: np.ndarray) -> np.ndarray:
+        q_full = np.zeros(self.model.nq, dtype=float)
+        q_full[: self.nq_arm] = q_arm
+        return q_full
+    
+    
+        
+    def fk_update(self, q_arm: np.ndarray) -> None:
+        pin = self.pin
+        q_full = self._q_full(q_arm)
+        pin.forwardKinematics(self.model, self.data, q_full) # these won't error out
+        pin.updateFramePlacements(self.model, self.data) # these won't error out
+
+    def ee_pos(self, q_arm: np.ndarray) -> np.ndarray:
+        self.fk_update(q_arm)
+        oMf = self.data.oMf[self.ee_fid]
+        return np.array(oMf.translation, dtype=float) + self.base_t
+
+    def _joint_positions_plus_ee(self) -> List[np.ndarray]:
+        """
+        World positions of joint origins for panda_joint1..7 and then EE frame as last.
+        Assumes fk_update already called.
+        """
+        pts: List[np.ndarray] = []
+        for jid in self.arm_jids:
+            oMi = self.data.oMi[jid]
+            pts.append(np.array(oMi.translation, dtype=float) + self.base_t)
+        pts.append(np.array(self.data.oMf[self.ee_fid].translation, dtype=float) + self.base_t)
+        return pts
+
+    def proxy_spheres(self, q_arm: np.ndarray, ee_radius: float) -> List[Tuple[np.ndarray, float]]:
+        """
+        Build spheres along segments between consecutive joints and to EE.
+        Also include an EE sphere with the provided ee_radius.
+        """
+        self.fk_update(q_arm)
+        pts = self._joint_positions_plus_ee()
+
+        spheres: List[Tuple[np.ndarray, float]] = []
+        for a, b in zip(pts[:-1], pts[1:]):
+            a = np.asarray(a, dtype=float)
+            b = np.asarray(b, dtype=float)
+            for k in range(1, self.K + 1):
+                t = k / (self.K + 1)
+                c = (1 - t) * a + t * b
+                spheres.append((c, self.proxy_r))
+
+        spheres.append((pts[-1], float(ee_radius)))
+        return spheres
+            
+    def ik_position(
+        self,
+        target_world: np.ndarray,
+        q_init: np.ndarray,
+        iters: int = 120,
+        tol: float = 1e-3,
+        damping: float = 1e-2,
+        step: float = 0.7,
+    ) -> np.ndarray:
+        """
+        Damped least-squares IK for EE position only.
+        target_world is in the SAME world frame as bounds/obstacles.
+        """
+        pin = self.pin
+        q = self.clamp_q(np.asarray(q_init, dtype=float).copy())
+
+        # Convert world target -> model frame (undo base translation)
+        target_model = np.asarray(target_world, dtype=float) - self.base_t
+
+        for _ in range(iters):
+            q_full = self._q_full(q)
+            pin.forwardKinematics(self.model, self.data, q_full)
+            pin.updateFramePlacements(self.model, self.data)
+
+            oMf = self.data.oMf[self.ee_fid]
+            cur = np.array(oMf.translation, dtype=float)
+            err = target_model - cur
+
+            if float(np.linalg.norm(err)) < tol:
+                break
+
+            J6 = pin.computeFrameJacobian(
+                self.model, self.data, q_full, self.ee_fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            )
+            J = J6[:3, : self.nq_arm]  # 3x7
+
+            A = J @ J.T + (damping ** 2) * np.eye(3)
+            dq = J.T @ np.linalg.solve(A, err)
+
+            q = self.clamp_q(q + step * dq)
+
+        return q
+# ----------------------------
+# Task
+# ----------------------------
 @dataclass
 class FridgeReachConfig:
     ee_radius: float = 0.035
     goal_tol: float = 0.05
     step_size: float = 0.05
     w_collide: float = 1000.0
+    w_step: float = 0.01
 
-class FridgeReachEE3D:
-    name = "fridge_reach_ee_3d"
+    base_translation: Tuple[float, float, float] = (-0.1, 0.95, -0.1)
+    proxy_radius: float = 0.03
+    spheres_per_segment: int = 4
+    ee_frame: str = "panda_hand"
+
+
+class FridgeReachFrankaGeom3D:
+    name = "fridge_reach_franka_geom3d"
 
     def __init__(self, cfg: FridgeReachConfig | None = None):
         self.cfg = cfg or FridgeReachConfig()
+        self._robot: Optional[FrankaGeom3D] = None
+
+    def _ensure_robot(self) -> None:
+        if self._robot is not None:
+            return
+
+        import pybullet_data
+
+        urdf_path = os.path.join(pybullet_data.getDataPath(), "franka_panda/panda.urdf")
+        if not os.path.exists(urdf_path):
+            raise FileNotFoundError(
+                f"Could not find Panda URDF at '{urdf_path}'. "
+                "Your pybullet_data may not include Franka assets."
+            )
+
+        self._robot = FrankaGeom3D(
+            urdf_path=urdf_path,
+            ee_frame=self.cfg.ee_frame,
+            base_translation=self.cfg.base_translation,
+            proxy_radius=self.cfg.proxy_radius,
+            spheres_per_segment=self.cfg.spheres_per_segment,
+        )
 
     def reset(self, rng) -> State:
-        # Workspace inside fridge (meters): width x depth x height
+        self._ensure_robot()
+        assert self._robot is not None
+
         bounds: AABB = (0.0, 0.0, 0.0, 0.8, 0.6, 0.8)
-        
-        # Obstacles: a shelf slab + a couple clutter boxes
         obstacles: List[AABB] = [
-            # shelf slab (thin in z)
-            (0.02, 0.02, 0.35, 0.78, 0.58, 0.38),
-            # bottle/carton
+            (0.0, 0.0, 0.35, 0.80, 0.6, 0.38),
             (0.35, 0.22, 0.38, 0.43, 0.30, 0.65),
-            # side bin wall protrusion
-            (0.68, 0.00, 0.00, 0.80, 0.10, 0.80),
+            (0.62, 0.45, 0.38, 0.70, 0.50, 0.50),
+            (0.22, 0.33, 0.38, 0.26, 0.37, 0.50),
         ]
 
-        # Start near opening (front is y ~ 0.6), goal deeper in
-        ee_pos = np.array([0.10, 0.55, 0.55], dtype=float)
         goal_pos = np.array([0.55, 0.25, 0.55], dtype=float)
 
+
+        # --- NEW: choose a start EE pose (outside the open front, higher to avoid shelf) ---
+        start_ee = np.array([0.10, 0.70, 0.72], dtype=float)
+
+        q_seed = np.array([0.0, -0.6, 0.0, -2.0, 0.0, 1.6, 0.8], dtype=float)
+        q0 = self._robot.ik_position(start_ee, q_seed)
+        q0 = self._robot.clamp_q(q0)
+
+        ee_pos = self._robot.ee_pos(q0)
+        spheres = self._robot.proxy_spheres(q0, ee_radius=self.cfg.ee_radius)
+        collided = collided_obstacles_only(spheres, obstacles)
         return {
+            "q": q0,
             "ee_pos": ee_pos,
             "goal_pos": goal_pos,
             "ee_radius": float(self.cfg.ee_radius),
             "obstacles": obstacles,
             "bounds": bounds,
-            "collided": False,
+            "collided": bool(collided),
             "step_size": float(self.cfg.step_size),
-            "w_step": 0.01,
+            "w_step": float(self.cfg.w_step),
         }
+
+    def step(self, state: State, action: np.ndarray) -> Tuple[State, Dict[str, Any]]:
+        self._ensure_robot()
+        assert self._robot is not None
+
+        q = np.asarray(state["q"], dtype=float)
+        a = np.asarray(action, dtype=float).reshape(-1)
+        if a.shape != (7,):
+            raise ValueError(f"Expected action shape (7,), got {a.shape}")
+
+        # NOTE: if you want micro-stepping in the simulator, avoid normalizing here.
+        # Keeping your existing behavior for now:
+        max_norm = 1.0  # tune
+        n = float(np.linalg.norm(a))
+        if n > max_norm:
+            a = a * (max_norm / n)
+
+        q_next = self._robot.clamp_q(q + float(state["step_size"]) * a)
+
+        ee_pos = self._robot.ee_pos(q_next)
+        spheres = self._robot.proxy_spheres(q_next, ee_radius=float(state["ee_radius"]))
+        collided = collided_obstacles_only(spheres, state["obstacles"])
+
+        next_state = dict(state)
+        next_state["q"] = q_next
+        next_state["ee_pos"] = ee_pos
+        next_state["collided"] = bool(collided)
+
+        info: Dict[str, Any] = {
+            "collided": bool(collided),
+            "step_cost": float(state.get("w_step", 0.0)),
+            "ee_pos": ee_pos,
+        }
+        return next_state, info
 
     def is_success(self, state: State) -> bool:
         if state.get("collided", False):
             return False
-        d = float(np.linalg.norm(state["ee_pos"] - state["goal_pos"]))
+        d = float(np.linalg.norm(np.asarray(state["ee_pos"]) - np.asarray(state["goal_pos"])))
         return d < self.cfg.goal_tol
 
     def score(self, traj: Trajectory) -> float:
         final = traj.states[-1]
-        dist = float(np.linalg.norm(final["ee_pos"] - final["goal_pos"]))
+        dist = float(np.linalg.norm(np.asarray(final["ee_pos"]) - np.asarray(final["goal_pos"])))
         collided = any(info.get("collided", False) for info in traj.infos)
-        step_cost = 0.0
-        for info in traj.infos:
-            step_cost += float(info.get("step_cost", 0.0))
+        step_cost = sum(float(info.get("step_cost", 0.0)) for info in traj.infos)
         return dist + (self.cfg.w_collide if collided else 0.0) + step_cost
 
-@register_task("fridge_reach_ee_3d")
+
+@register_task("fridge_reach_franka_geom3d")
 def _make_task():
-    return FridgeReachEE3D()
+    return FridgeReachFrankaGeom3D()
