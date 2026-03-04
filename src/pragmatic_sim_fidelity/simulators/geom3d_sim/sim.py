@@ -1,34 +1,45 @@
+"""Geom3DSimulator: a simple 3D geometric simulator for Franka joint-space planning."""
+
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
 from typing import List
+
 import numpy as np
 
-from ...core.types import State, Action, Trajectory
+from ...core.types import Action, State, Trajectory
 from ...registry import register_sim
 
 
 @dataclass
 class Geom3DConfig:
+    """We take six steps per action to prevent "tunneling" in joint-space."""
+
     micro_steps: int = 6  # prevents "tunneling" in joint-space
 
 
 class Geom3DSimulator:
+    """A simple 3D geometric simulator for Franka joint-space planning."""
+
     name = "geom3d"
 
     def __init__(self, cfg: Geom3DConfig | None = None):
+        """Initialize the simulator with a given config."""
         self.cfg = cfg or Geom3DConfig()
         self._state: State | None = None
 
     def reset(self, state: State) -> None:
+        """Reset the simulator to a given state."""
         self._state = copy.deepcopy(state)
 
     def get_state(self) -> State:
+        """Get the current state of the simulator."""
         assert self._state is not None
         return copy.deepcopy(self._state)
 
     def _extract_dq(self, action: Action) -> np.ndarray:
+        """Extract the 7D delta_q from a delta_q action."""
         if "dq" in action.params:
             dq = np.asarray(action.params["dq"], dtype=float).reshape(-1)
             if dq.shape != (7,):
@@ -39,13 +50,13 @@ class Geom3DSimulator:
         if all(k in action.params for k in keys):
             return np.array([float(action.params[k]) for k in keys], dtype=float)
 
-        raise ValueError("delta_q action missing params: provide 'dq' (len 7) or dq0..dq6")
+        raise ValueError(
+            "delta_q action missing params: provide 'dq' (len 7) or dq0..dq6"
+        )
 
     def step(self, action: Action, task) -> State:
-        """
-        Expects task.step(state, dq_inc)->(next_state, info)
-        where dq_inc is a small 7D joint increment direction/command.
-        """
+        """Expects task.step(state, dq_inc)->(next_state, info) where dq_inc is a small
+        7D joint increment direction/command."""
         assert self._state is not None
 
         if action.kind != "delta_q":
@@ -73,6 +84,8 @@ class Geom3DSimulator:
         return self.get_state()
 
     def rollout(self, state0: State, actions: List[Action], task) -> Trajectory:
+        """Rollout a trajectory from a given initial state and sequence of actions and
+        return the trajectory as a list of states."""
         self.reset(state0)
         states = [self.get_state()]
         infos = []
@@ -80,6 +93,7 @@ class Geom3DSimulator:
 
         for a in actions:
             s = self.step(a, task)
+            # print("taking action:", a)
             infos.append(
                 {
                     "collided": bool(s.get("collided", False)),
